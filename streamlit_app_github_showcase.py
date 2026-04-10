@@ -346,7 +346,7 @@ def render_header() -> None:
         """
         <div class="hero">
             <h1>📊 IRT + MIRT 学情分析平台</h1>
-            <p>适合放到 GitHub 展示的 Streamlit 应用版本：自动运行 IRT 与 Python 近似 MIRT，输出学生画像、题目诊断、群体结构和可导出报告。</p>
+            <p>自动运行 IRT 与 Python 近似 MIRT，输出学生画像、题目诊断、群体结构和可导出报告。</p>
             <div class="pill-row">
                 <span class="pill">学生学情画像</span>
                 <span class="pill">题目参数诊断</span>
@@ -358,10 +358,10 @@ def render_header() -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.markdown(
-        '<div class="note-card"><div class="section-title">这版做了什么</div><div class="subtle">我把你的前端升级成更适合发布到 GitHub 的展示版：首屏更完整、图表更多、层次更清楚，同时保持你现有的 IRT + Python 近似 MIRT 管线不变。</div></div>',
-        unsafe_allow_html=True,
-    )
+    # st.markdown(
+    #     '<div class="note-card"><div class="section-title">这版做了什么</div><div class="subtle">我把你的前端升级成更适合发布到 GitHub 的展示版：首屏更完整、图表更多、层次更清楚，同时保持你现有的 IRT + Python 近似 MIRT 管线不变。</div></div>',
+    #     unsafe_allow_html=True,
+    # )
 
 
 def render_sidebar() -> Dict[str, Any]:
