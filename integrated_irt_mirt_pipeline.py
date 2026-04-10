@@ -1,17 +1,16 @@
+
 from __future__ import annotations
 
 import io
 import json
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -231,14 +230,12 @@ def build_mirt_model_text(
         if len(positions) >= cfg.min_items_per_factor
     }
 
-    factor_name_map: Dict[str, str] = {}
     model_lines: List[str] = []
     factor_meta: List[Dict[str, Any]] = []
     kept_positions: set[int] = set()
 
-    for idx, mid_id in enumerate(sorted(filtered_mid_to_positions.keys()), start=1):
+    for idx, mid_id in enumerate(sorted(filtered_mid_to_positions), start=1):
         factor_name = f"F{idx}"
-        factor_name_map[mid_id] = factor_name
         positions = filtered_mid_to_positions[mid_id]
         pos_part = ",".join(str(p) for p in positions)
         model_lines.append(f"{factor_name} = {pos_part}")
@@ -250,7 +247,7 @@ def build_mirt_model_text(
         })
         kept_positions.update(positions)
 
-    model_text = "\n".join(model_lines) + "\n"
+    model_text = "\n".join(model_lines) + ("\n" if model_lines else "")
     kept_safe_items = [safe_item_names[p - 1] for p in sorted(kept_positions)]
     return model_text, factor_meta, kept_safe_items
 
@@ -323,19 +320,167 @@ def prepare_mirt_inputs(
 
 
 # -------------------------
+# Python approx-MIRT
+# -------------------------
+def _sigmoid(x: np.ndarray | float) -> np.ndarray | float:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _safe_corr(a: pd.Series, b: pd.Series) -> float:
+    mask = a.notna() & b.notna()
+    if mask.sum() < 3:
+        return 0.0
+    av = a[mask].astype(float)
+    bv = b[mask].astype(float)
+    if av.nunique() <= 1 or bv.nunique() <= 1:
+        return 0.0
+    val = np.corrcoef(av, bv)[0, 1]
+    if np.isnan(val):
+        return 0.0
+    return float(val)
+
+
+def run_python_mirt(
+    response_matrix_df: pd.DataFrame,
+    item_meta_df: pd.DataFrame,
+    factor_meta_df: pd.DataFrame,
+    results_dir: str | os.PathLike,
+) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+    """
+    这是一个 Python 版“近似 MIRT”流程，不是严格的 EM/MHRM 拟合。
+    核心思想：
+    1) 依据二级知识点把题目分到多个维度；
+    2) 用题目正确率估计难度，用题目与维度总分相关近似区分度；
+    3) 用每个维度上的标准化表现，生成学生多维能力分数。
+    """
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    mat = response_matrix_df.copy().sort_index().sort_index(axis=1)
+    factor_meta_df = factor_meta_df.copy()
+    item_meta_df = item_meta_df.copy()
+
+    n_students, n_items = mat.shape
+    n_factors = len(factor_meta_df)
+    yield {"stage": "mirt_fit", "progress": 0.58, "message": f"开始 Python 近似 MIRT：{n_students} 名学生，{n_items} 道题，{n_factors} 个二级知识点维度。"}
+
+    # 维度到题目的映射
+    factor_to_items: Dict[str, List[str]] = {}
+    for _, row in factor_meta_df.iterrows():
+        factor_to_items[str(row["factor_name"])] = []
+
+    factor_name_by_mid = {str(r["mid_id"]): str(r["factor_name"]) for _, r in factor_meta_df.iterrows()}
+    for _, row in item_meta_df.iterrows():
+        safe_item = str(row["safe_item_id"])
+        mids = [x for x in str(row.get("mid_ids", "")).split("|") if x]
+        for mid in mids:
+            fname = factor_name_by_mid.get(mid)
+            if fname:
+                factor_to_items.setdefault(fname, []).append(safe_item)
+
+    console_lines: List[str] = []
+    factor_scores = pd.DataFrame(index=mat.index)
+    item_params_rows: List[Dict[str, Any]] = []
+    fit_rows: List[Dict[str, Any]] = []
+
+    overall_score = mat.mean(axis=1, skipna=True).fillna(mat.mean(axis=1, skipna=True).mean())
+    overall_z = ((overall_score - overall_score.mean()) / (overall_score.std(ddof=0) or 1.0)).fillna(0.0)
+
+    factor_names = list(factor_meta_df["factor_name"].astype(str))
+    for idx, factor_name in enumerate(factor_names, start=1):
+        items = [c for c in factor_to_items.get(factor_name, []) if c in mat.columns]
+        if not items:
+            continue
+        sub = mat[items]
+        non_missing_count = sub.notna().sum(axis=1)
+        raw = sub.mean(axis=1, skipna=True)
+        global_mean = float(sub.stack().mean()) if not sub.stack().empty else 0.5
+        shrink = non_missing_count / np.maximum(non_missing_count + 3, 1)
+        smoothed = raw.fillna(global_mean) * shrink + global_mean * (1 - shrink)
+        z = ((smoothed - smoothed.mean()) / (smoothed.std(ddof=0) or 1.0)).fillna(0.0)
+        factor_scores[factor_name] = z
+        factor_scores[f"SE_{factor_name}"] = (1.0 / np.sqrt(np.maximum(non_missing_count, 1))).astype(float)
+
+        line = f"[{idx}/{len(factor_names)}] 完成维度 {factor_name}，题量={len(items)}，平均作答覆盖={float(non_missing_count.mean()):.2f}"
+        console_lines.append(line)
+        fit_rows.append({
+            "factor_name": factor_name,
+            "n_items": len(items),
+            "students": int(len(z)),
+            "mean_score": float(z.mean()),
+            "std_score": float(z.std(ddof=0)),
+            "avg_coverage": float(non_missing_count.mean()),
+        })
+        yield {
+            "stage": "mirt_fit",
+            "progress": 0.58 + 0.22 * idx / max(len(factor_names), 1),
+            "message": line,
+            "console": "\n".join(console_lines[-200:]),
+        }
+
+    # 题目参数近似
+    for _, row in item_meta_df.iterrows():
+        safe_item = str(row["safe_item_id"])
+        original_item_id = str(row["original_item_id"])
+        mids = [x for x in str(row.get("mid_ids", "")).split("|") if x]
+        primary_factor = factor_name_by_mid.get(mids[0], None) if mids else None
+        item_series = mat[safe_item]
+        p = float(item_series.mean(skipna=True)) if item_series.notna().any() else 0.5
+        p = min(max(p, 1e-4), 1 - 1e-4)
+        b = float(np.log((1 - p) / p))
+        base_score = factor_scores[primary_factor] if primary_factor and primary_factor in factor_scores.columns else overall_z
+        a = max(0.25, min(3.0, abs(_safe_corr(item_series, base_score)) * 2.2 + 0.4))
+        pred = _sigmoid(a * (base_score.fillna(0.0) - b))
+        mask = item_series.notna()
+        if mask.sum() > 0:
+            y = item_series[mask].astype(float)
+            phat = np.clip(pred[mask].astype(float), 1e-5, 1 - 1e-5)
+            nll = float(-(y * np.log(phat) + (1 - y) * np.log(1 - phat)).mean())
+        else:
+            nll = np.nan
+
+        item_params_rows.append({
+            "original_item_id": original_item_id,
+            "safe_item_id": safe_item,
+            "primary_factor": primary_factor,
+            "mid_ids": "|".join(mids),
+            "a": float(a),
+            "b": float(b),
+            "p_correct": float(p),
+            "nll": nll,
+            "n_obs": int(mask.sum()),
+        })
+
+    item_params_df = pd.DataFrame(item_params_rows)
+    factor_scores = factor_scores.reset_index().rename(columns={"student_id": "student_id"})
+    factor_scores.insert(0, "student_id", factor_scores.pop(factor_scores.columns[0]))
+
+    model_summary = {
+        "method": "python_approx_mirt",
+        "note": "这是按二级知识点生成的近似多维能力分数，不是严格的 MIRT EM/MHRM 最大似然拟合。",
+        "n_students": int(n_students),
+        "n_items": int(n_items),
+        "n_factors": int(n_factors),
+        "factor_fit": fit_rows,
+        "item_nll_mean": float(item_params_df["nll"].dropna().mean()) if not item_params_df.empty else None,
+    }
+
+    factor_scores.to_csv(results_dir / "student_factor_scores.csv", index=False, encoding="utf-8-sig")
+    item_params_df.to_csv(results_dir / "item_params.csv", index=False, encoding="utf-8-sig")
+    _save_json(model_summary, results_dir / "model_summary.json")
+
+    yield {"stage": "mirt_fit", "progress": 0.84, "message": "Python 近似 MIRT 拟合完成。", "console": "\n".join(console_lines[-200:])}
+    return {
+        "student_factor_scores_df": factor_scores,
+        "item_params_df": item_params_df,
+        "model_summary": model_summary,
+        "console_lines": console_lines,
+    }
+
+
+# -------------------------
 # Reporting helpers
 # -------------------------
-def load_factor_outputs(results_dir: str | os.PathLike) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    results_dir = Path(results_dir)
-    scores_path = results_dir / "student_factor_scores.csv"
-    item_path = results_dir / "item_params.csv"
-    summary_path = results_dir / "model_summary.json"
-    scores = pd.read_csv(scores_path, dtype={"student_id": str}) if scores_path.exists() else pd.DataFrame()
-    item_params = pd.read_csv(item_path) if item_path.exists() else pd.DataFrame()
-    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
-    return scores, item_params, summary
-
-
 def build_student_knowledge_report(
     student_id: str,
     students_enriched: List[Dict[str, Any]],
@@ -356,7 +501,7 @@ def build_student_knowledge_report(
 
     factor_meta_df = factor_meta_df.copy() if factor_meta_df is not None else pd.DataFrame()
     if not factor_meta_df.empty and not factor_scores_df.empty:
-        score_cols = [c for c in factor_scores_df.columns if c.startswith("F")]
+        score_cols = [c for c in factor_scores_df.columns if c.startswith("F") and not c.startswith("SE_")]
         population_mean = factor_scores_df[score_cols].mean(numeric_only=True)
         population_std = factor_scores_df[score_cols].std(numeric_only=True).replace(0, np.nan)
         rows: List[Dict[str, Any]] = []
@@ -460,34 +605,22 @@ def generate_pipeline(
     yield {"stage": "irt", "progress": 0.35, "message": "IRT 完成，开始构造二级知识点 MIRT 输入矩阵。", "irt_metrics": irt_result["metrics"]}
 
     prep_result = prepare_mirt_inputs(students_raw, question_bank_raw, x_path, mirt_input_dir, cfg=mirt_prep_config or MIRTPrepConfig())
-    yield {"stage": "mirt_prepare", "progress": 0.5, "message": "MIRT 输入文件已生成，开始调用 R/mirt 拟合。", "mirt_input_summary": prep_result["summary"]}
+    yield {"stage": "mirt_prepare", "progress": 0.5, "message": "MIRT 输入文件已生成，开始执行 Python 近似 MIRT。", "mirt_input_summary": prep_result["summary"]}
 
-    if r_script_path is None:
-        r_script_path = str(Path(__file__).with_name("run_mirt_integrated.R"))
+    py_mirt_gen = run_python_mirt(
+        response_matrix_df=prep_result["response_matrix_df"],
+        item_meta_df=prep_result["item_meta_df"],
+        factor_meta_df=prep_result["factor_meta_df"],
+        results_dir=mirt_results_dir,
+    )
 
-    cmd = [
-        rscript_executable,
-        str(r_script_path),
-        str(mirt_input_dir / "response_matrix.csv"),
-        str(mirt_input_dir / "item_meta.csv"),
-        str(mirt_input_dir / "mirt_model.txt"),
-        str(mirt_input_dir / "question_mid_map.json"),
-        str(mirt_results_dir),
-    ]
+    try:
+        while True:
+            update = next(py_mirt_gen)
+            yield update
+    except StopIteration as e:
+        mirt_result = e.value
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-    console_lines: List[str] = []
-    if proc.stdout is not None:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            console_lines.append(line)
-            pct = 0.55 + min(0.35, len(console_lines) * 0.01)
-            yield {"stage": "mirt_fit", "progress": pct, "message": line, "console": "\n".join(console_lines[-200:])}
-    return_code = proc.wait()
-    if return_code != 0:
-        raise RuntimeError("R/mirt 拟合失败。\n" + "\n".join(console_lines[-80:]))
-
-    factor_scores_df, mirt_item_params_df, model_summary = load_factor_outputs(mirt_results_dir)
     factor_meta_payload = json.loads((mirt_input_dir / "question_mid_map.json").read_text(encoding="utf-8"))
     factor_meta_df = pd.DataFrame(factor_meta_payload.get("factor_meta", []))
     yield {"stage": "report", "progress": 0.95, "message": "MIRT 拟合完成，正在整理学生学情分析报告。"}
@@ -498,11 +631,11 @@ def generate_pipeline(
         "irt": irt_result,
         "mirt_prepare": prep_result,
         "mirt": {
-            "student_factor_scores_df": factor_scores_df,
-            "item_params_df": mirt_item_params_df,
-            "model_summary": model_summary,
+            "student_factor_scores_df": mirt_result["student_factor_scores_df"],
+            "item_params_df": mirt_result["item_params_df"],
+            "model_summary": mirt_result["model_summary"],
             "factor_meta_df": factor_meta_df,
-            "console_lines": console_lines,
+            "console_lines": mirt_result["console_lines"],
             "results_dir": str(mirt_results_dir),
         },
         "artifacts": {
@@ -518,7 +651,5 @@ def create_work_dir(base_dir: Optional[str | os.PathLike] = None) -> str:
     if base_dir:
         Path(base_dir).mkdir(parents=True, exist_ok=True)
         ts = time.strftime("run_%Y%m%d_%H%M%S")
-        path = Path(base_dir) / ts
-        path.mkdir(parents=True, exist_ok=True)
-        return str(path)
+        return str(Path(base_dir) / ts)
     return tempfile.mkdtemp(prefix="irt_mirt_run_")
